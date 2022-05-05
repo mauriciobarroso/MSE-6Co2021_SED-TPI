@@ -1,0 +1,6 @@
+[submodule "components/LIS2DH"]
+	path = components/LIS2DH
+	url = https://github.com/mauriciobarroso/LIS2DH.git
+[submodule "components/mpu6050"]
+	path = components/mpu6050
+	url = https://github.com/mauriciobarroso/mpu6050.git
