@@ -35,13 +35,14 @@
 /* Includes ------------------------------------------------------------------*/
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_event.h"
-#include "esp_event_loop.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -50,6 +51,7 @@
 #include "mqtt_client.h"
 #include "mpu6050.h"
 #include "file_server.c"
+#include "crono.c"
 
 /* Private includes ----------------------------------------------------------*/
 
@@ -66,12 +68,19 @@
 #define WIFI_STA_PASS				"orcobebe"
 #define WIFI_AP_SSID				"sd-tp"
 #define WIFI_AP_MAX_CONN			(3)
-#define MQTT_BROKER_URL				"mqtt://broker.hivemq.com:1883"
-#define MQTT_STATE_TOPIC			"state"
-#define MQTT_INCOMING_DATA_TOPIC	"incoming_data"
+#define MQTT_BROKER_HOST			"192.168.1.127"
+#define MQTT_BROKER_PORT			(1883)
+#define MQTT_IN_DATA_TOPIC			"data/in/node-app"
+#define MQTT_OUT_DATA_TOPIC			"data/out/node-esp32s2"
+#define MQTT_OUT
 
 #define IMU_SAMPLING_RATE_HZ		(100.0)
 #define IMU_SAMPLING_RATE_MS		((1 / IMU_SAMPLING_RATE_HZ) * 1000)
+#define IMU_ACCE_MAX_VALUE			(4.0)
+#define IMU_ACCE_IDLE_VALUE			(0.91)
+#define IMU_THRESHOLD_0				(IMU_ACCE_IDLE_VALUE + ((IMU_ACCE_MAX_VALUE - IMU_ACCE_IDLE_VALUE) / 4.5))
+#define IMU_THRESHOLD_1				(IMU_ACCE_IDLE_VALUE + ((IMU_ACCE_MAX_VALUE - IMU_ACCE_IDLE_VALUE) / 3.0))
+#define IMU_THRESHOLD_2				(IMU_ACCE_IDLE_VALUE + ((IMU_ACCE_MAX_VALUE - IMU_ACCE_IDLE_VALUE) / 1.5))
 
 /* Private macro -------------------------------------------------------------*/
 
@@ -86,6 +95,14 @@ static mpu6050_t mpu6050;
 static esp_mqtt_client_handle_t mqtt_client;
 static TaskHandle_t get_imu_data_handle = NULL;
 static char incoming_mqtt_data[256];
+static QueueHandle_t mqtt_queue;
+static bool stop_flag = false;
+static char timestamp[64]="";
+static int64_t epoch;
+static char file_name[32];
+FILE * log_file = NULL;
+static bool is_processing = false;
+
 
 /* Private function prototypes -----------------------------------------------*/
 /* Initialization functions */
@@ -115,14 +132,37 @@ void app_main(void) {
     ESP_ERROR_CHECK(nvs_init());
     ESP_ERROR_CHECK(wifi_init());
     ESP_ERROR_CHECK(mqtt_init());
-    ESP_ERROR_CHECK(file_server_init());
     ESP_ERROR_CHECK(spiffs_init());
+    ESP_ERROR_CHECK(file_server_init());
     ESP_ERROR_CHECK(i2c_master_init());
     ESP_ERROR_CHECK(mpu6050_init(&mpu6050, MPU6050_DEV_ADDR, I2C_MASTER_NUM, ACCE_FS_4G, GYRO_FS_250DPS));
 
-    ESP_LOGI(TAG, "sampling rate in ms is %d", (int)IMU_SAMPLING_RATE_MS);
+    /* Create RTOS components */
+    mqtt_queue = xQueueCreate(2, sizeof(int));
+
+    if(mqtt_queue == NULL) {
+    	ESP_LOGE(TAG, "Failed creating queue");
+
+    	for(;;) {}
+    }
+
+    ESP_LOGI(TAG, "sampling rate in ms is %d", (TickType_t)IMU_SAMPLING_RATE_MS);
+    ESP_LOGI(TAG, "threshold0 is %f", IMU_THRESHOLD_0);
+    ESP_LOGI(TAG, "threshold1 is %f", IMU_THRESHOLD_1);
+    ESP_LOGI(TAG, "threshold2 is %f", IMU_THRESHOLD_2);
 
     /* RTOS tasks creation */
+	if(get_imu_data_handle == NULL) {
+		if(xTaskCreate(get_imu_data_task,
+				"Get IMU data Task",
+				configMINIMAL_STACK_SIZE * 4,
+				NULL,
+				tskIDLE_PRIORITY + 1,
+				&get_imu_data_handle) != pdPASS) {
+			ESP_LOGE(TAG, "Failed creating RTOS task");
+			for(;;) {}
+		}
+	}
 }
 
 /* Initialization functions */
@@ -268,7 +308,8 @@ static esp_err_t mqtt_init(void) {
 	/* Fill MQTT client configuration and initialize */
 	/* todo: implement certificates and keys */
 	esp_mqtt_client_config_t mqtt_config = {
-			.uri = MQTT_BROKER_URL,
+			.host = MQTT_BROKER_HOST,
+			.port = MQTT_BROKER_PORT,
 			.client_cert_pem = NULL,
 			.client_key_pem = NULL,
 			.cert_pem = NULL,
@@ -412,6 +453,12 @@ static void ip_event_handler(void * arg, esp_event_base_t event_base,
 			/* Start MQTT client */
 			esp_mqtt_client_start(mqtt_client);
 
+			/* Initialize SNTP */
+			CRONO_sntpInit();
+			epoch = CRONO_getTime(timestamp, sizeof(timestamp));
+			printf("MAIN: Timestamp %s: \n", timestamp);
+			printf("MAIN: Epoch %lli: \n'", epoch);
+
 			break;
 		}
 
@@ -431,21 +478,12 @@ static void mqtt_event_handler(void * arg, esp_event_base_t event_base,
 		case MQTT_EVENT_CONNECTED: {
 			ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
 
-			/* Publish to user defined alive topic */
-			if(esp_mqtt_client_publish(mqtt_client, MQTT_STATE_TOPIC, "connected", 0, 0, 0) == -1) {
-				ESP_LOGE(TAG, "Failed publishing to topic");
-			}
-			else {
-				ESP_LOGI(TAG, "Sent publish successful to %s topic", MQTT_STATE_TOPIC);
-			}
-
-
 			/* Subscribe to user defined valve state and ota notification topics */
-			if(esp_mqtt_client_subscribe(mqtt_client, MQTT_INCOMING_DATA_TOPIC, 0) == -1) {
+			if(esp_mqtt_client_subscribe(mqtt_client, MQTT_IN_DATA_TOPIC, 0) == -1) {
 				ESP_LOGE(TAG, "Failed subscribing to topic");
 			}
 			else {
-				ESP_LOGI(TAG, "Sent subscribe successful to %s topic", MQTT_INCOMING_DATA_TOPIC);
+				ESP_LOGI(TAG, "Sent subscribe successful to %s topic", MQTT_IN_DATA_TOPIC);
 			}
 
 			break;
@@ -465,33 +503,40 @@ static void mqtt_event_handler(void * arg, esp_event_base_t event_base,
 			ESP_LOGI(TAG, "data=%s", incoming_mqtt_data);
 
 			/* Check if the array is a number */
-			if(atoi(incoming_mqtt_data)) {
-				int get_data_time = atoi(incoming_mqtt_data);
+			int get_data_time = atoi(incoming_mqtt_data);
 
-				if(get_data_time > 0) {
-					if(get_data_time > 60) {
-						get_data_time = 60;
-					}
+			if(get_data_time > 0 && !is_processing) {
+				/* Get file name to register imu data */
+				epoch = CRONO_getTime(timestamp, sizeof(timestamp));
+				sprintf(file_name, "/spiffs/A%lld.csv", epoch);
 
-					ESP_LOGI(TAG, "time=%d", get_data_time);
-					sprintf(incoming_mqtt_data, "%d", get_data_time);
+				/* Open log file to register MQTT events */
+				ESP_LOGI(TAG, "Opening or creating file log.txt...");
 
-					/* Create task to get IMU data */
-					if(get_imu_data_handle == NULL) {
-						if(xTaskCreate(get_imu_data_task,
-								"Get IMU data Task",
-								configMINIMAL_STACK_SIZE * 4,
-								incoming_mqtt_data,
-								tskIDLE_PRIORITY + 1,
-								&get_imu_data_handle) != pdPASS) {
-							ESP_LOGE(TAG, "Failed creating RTOS task");
-						}
-					}
+				log_file = fopen("/spiffs/log.txt", "a");
+
+				if(log_file == NULL) {
+					ESP_LOGE(TAG, "Failed to open file for writing");
 				}
+
+				/* Print name of the measurements file */
+				fprintf(log_file, "A%lld.csv\n", epoch);
+
+				/* Print event in log file */
+				fprintf(log_file, "%s MQTT-IN: %s %s\n", timestamp, MQTT_IN_DATA_TOPIC, incoming_mqtt_data);
+
+				/* Check for values over 60 sec */
+				if(get_data_time > 60) {
+					get_data_time = 60;
+				}
+
+				/* Send data to IMU task */
+				xQueueSend(mqtt_queue, (void *)&get_data_time, 0);
 			}
 			/* Check if the array is the stop command */
 			else if(!strcmp(incoming_mqtt_data, "stop")) {
-				ESP_LOGI(TAG, "stop command");
+				ESP_LOGI(TAG, "Stop command");
+				stop_flag = true;
 			}
 			/* Other messages */
 			else {
@@ -509,43 +554,97 @@ static void mqtt_event_handler(void * arg, esp_event_base_t event_base,
 
 /* RTOS tasks */
 void get_imu_data_task(void * arg) {
-	int get_data_time = atoi((const char *)arg);
-	ESP_LOGI(TAG, "get data time in seconds is %d", get_data_time);
-	TickType_t last_time_wake = xTaskGetTickCount();
-	int samples_count = 0;
-
-	mpu6050_acce_value_t acce;
-	mpu6050_gyro_value_t gyro;
-
-    ESP_LOGI(TAG, "Opening file");
-
-    FILE * f = fopen("/spiffs/data.csv", "w");
-
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        return;
-    }
-
-	fprintf(f, "timestamp,gyro_x,gyro_y,gyro_z\n");
-
-	ESP_LOGI(TAG, "Getting data...");
+	int get_data_time;
 
 	for(;;) {
-		mpu6050_get_acce(&mpu6050, &acce);
-		mpu6050_get_gyro(&mpu6050, &gyro);
-		printf("gyro_x:%.2f, gyro_y:%.2f, gyro_z:%.2f\n", gyro.gyro_x, gyro.gyro_y, gyro.gyro_z);
+		if(xQueueReceive(mqtt_queue, &get_data_time, portMAX_DELAY)) {
+			/* Set is_processing flag */
+			is_processing = true;
 
-		fprintf(f, "%d,%.2f,%.2f,%.2f\n", xTaskGetTickCount(), gyro.gyro_x, gyro.gyro_y, gyro.gyro_z);
+			ESP_LOGI(TAG, "Creating file A%lld.csv...", epoch);
 
+			FILE * f = fopen(file_name, "w");
 
-		vTaskDelayUntil(&last_time_wake, pdMS_TO_TICKS((TickType_t)IMU_SAMPLING_RATE_MS));
+			if (f == NULL) {
+				ESP_LOGE(TAG, "Failed to open file for writing");
 
-		if(++samples_count >= (int)((float)get_data_time / (1 / IMU_SAMPLING_RATE_HZ))) {
-			ESP_LOGI(TAG, "Samples quantity reached. Closing file and deleting task...");
+				break;
+			}
+
+			fprintf(f, "timestamp,acce_z\n");
+
+			ESP_LOGI(TAG, "Getting data...");
+
+			int samples_count = 0;
+			mpu6050_acce_value_t acce;
+			float acce_max = 0;
+			TickType_t last_time_wake = xTaskGetTickCount();
+			TickType_t initial_ticks = xTaskGetTickCount();
+			TickType_t ms_elapsed = 0;
+
+			/**/
+			while(samples_count++ < (int)((float)get_data_time / (1 / IMU_SAMPLING_RATE_HZ)) &&
+					!stop_flag) {
+				/* Get accelerometer data */
+				mpu6050_get_acce(&mpu6050, &acce);
+
+				/**/
+				if(acce.acce_z > acce_max) {
+					acce_max = acce.acce_z;
+				}
+
+				/* Print to console */
+				printf("timestamp:%d, acce_z:%.2f\n", ms_elapsed, acce.acce_z);
+
+				/* Print to file */
+				fprintf(f, "%d,%.2f\n", ms_elapsed, acce.acce_z);
+
+				/* Check thresholds and publish */
+				if(samples_count % 50 == 1) { /* todo: in macros */
+					if(IMU_THRESHOLD_0 < acce_max && acce_max < IMU_THRESHOLD_1) {
+						esp_mqtt_client_publish(mqtt_client, MQTT_OUT_DATA_TOPIC, "THRESHOLD0", 0, 0, 0);
+						printf("THRESHOLD0\n");
+						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUT_DATA_TOPIC, "THRESHOLD0");
+					}
+					else if(IMU_THRESHOLD_1 < acce_max && acce_max < IMU_THRESHOLD_2) {
+						esp_mqtt_client_publish(mqtt_client, MQTT_OUT_DATA_TOPIC, "THRESHOLD1", 0, 0, 0);
+						printf("THRESHOLD1\n");
+						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUT_DATA_TOPIC, "THRESHOLD1");
+					}
+					else if(acce_max > IMU_THRESHOLD_2) {
+						esp_mqtt_client_publish(mqtt_client, MQTT_OUT_DATA_TOPIC, "THRESHOLD2", 0, 0, 0);
+						printf("THRESHOLD2\n");
+						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUT_DATA_TOPIC, "THRESHOLD2");
+					}
+					else {
+						printf("IDLE\n");
+					}
+
+					acce_max = 0;
+				}
+
+				/* Wait for IMU_SAMPLING_RATE_MS time */
+				vTaskDelayUntil(&last_time_wake, pdMS_TO_TICKS(IMU_SAMPLING_RATE_MS));
+
+				/* Calculate timestamp */
+				ms_elapsed = pdTICKS_TO_MS(xTaskGetTickCount() - initial_ticks);
+			}
+
+			ESP_LOGI(TAG, "Samples quantity reached or stop flag set. Closing file...");
+			if(stop_flag) {
+				fprintf(log_file, "%s MQTT-IN: %s %s\n", timestamp, MQTT_IN_DATA_TOPIC, incoming_mqtt_data);
+				stop_flag = false;
+			}
+
+			acce_max = 0;
+			is_processing = false;
+			samples_count = 0;
+			ESP_LOGI(TAG, "Closing file A%lld.csv...", epoch);
 			fclose(f);
-			get_imu_data_handle = NULL;
-
-			break;
+			fclose(log_file);
+		}
+		else {
+			ESP_LOGE(TAG, "Failed receiving data from queue...");
 		}
 	}
 
