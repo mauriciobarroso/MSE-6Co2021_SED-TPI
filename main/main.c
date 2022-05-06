@@ -64,14 +64,14 @@
 #define I2C_MASTER_TX_BUF_DISABLE   (0)			/*!< I2C master doesn't need buffer */
 #define I2C_MASTER_RX_BUF_DISABLE   (0)			/*!< I2C master doesn't need buffer */
 
-#define WIFI_STA_SSID				"test"
-#define WIFI_STA_PASS				"orcobebe"
-#define WIFI_AP_SSID				"sd-tp"
-#define WIFI_AP_MAX_CONN			(3)
-#define MQTT_BROKER_HOST			"192.168.1.127"
-#define MQTT_BROKER_PORT			(1883)
-#define MQTT_IN_DATA_TOPIC			"data/app"
-#define MQTT_OUT_DATA_TOPIC			"data/node"
+#define WIFI_STA_SSID				CONFIG_APP_WIFI_STA_SSID
+#define WIFI_STA_PASS				CONFIG_APP_WIFI_STA_PASS
+#define WIFI_AP_SSID				CONFIG_APP_WIFI_AP_SSID
+#define WIFI_AP_MAX_CONN			CONFIG_APP_WIFI_AP_MAX_CONN
+#define MQTT_HOST					CONFIG_APP_MQTT_HOST
+#define MQTT_PORT					CONFIG_APP_MQTT_PORT
+#define MQTT_INPUT_TOPIC			CONFIG_APP_MQTT_INPUT_TOPIC
+#define MQTT_OUTPUT_TOPIC			CONFIG_APP_MQTT_OUTPUT_TOPIC
 
 #define IMU_SAMPLING_RATE_HZ		(100.0)
 #define IMU_SAMPLING_RATE_MS		((1 / IMU_SAMPLING_RATE_HZ) * 1000)
@@ -128,14 +128,13 @@ void get_imu_data_task(void * arg);
 /* main */
 void app_main(void) {
 	/* Modules initialization */
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_ERROR_CHECK(mpu6050_init(&mpu6050, MPU6050_DEV_ADDR, I2C_MASTER_NUM, ACCE_FS_4G, GYRO_FS_250DPS));
     ESP_ERROR_CHECK(nvs_init());
     ESP_ERROR_CHECK(wifi_init());
     ESP_ERROR_CHECK(mqtt_init());
     ESP_ERROR_CHECK(spiffs_init());
     ESP_ERROR_CHECK(file_server_init());
-    ESP_ERROR_CHECK(i2c_master_init());
-    ESP_ERROR_CHECK(mpu6050_init(&mpu6050, MPU6050_DEV_ADDR, I2C_MASTER_NUM, ACCE_FS_4G, GYRO_FS_250DPS));
-	CRONO_sntpInit();
 
     /* Create RTOS components */
     mqtt_queue = xQueueCreate(2, sizeof(int));
@@ -308,8 +307,8 @@ static esp_err_t mqtt_init(void) {
 	/* Fill MQTT client configuration and initialize */
 	/* todo: implement certificates and keys */
 	esp_mqtt_client_config_t mqtt_config = {
-			.host = MQTT_BROKER_HOST,
-			.port = MQTT_BROKER_PORT,
+			.host = MQTT_HOST,
+			.port = MQTT_PORT,
 			.client_cert_pem = NULL,
 			.client_key_pem = NULL,
 			.cert_pem = NULL,
@@ -451,6 +450,9 @@ static void ip_event_handler(void * arg, esp_event_base_t event_base,
 		case IP_EVENT_STA_GOT_IP: {
 			ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP");
 
+			/* Start SNTP */
+			CRONO_sntpInit();
+
 			/* Start MQTT client */
 			esp_mqtt_client_start(mqtt_client);
 
@@ -474,11 +476,11 @@ static void mqtt_event_handler(void * arg, esp_event_base_t event_base,
 			ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
 
 			/* Subscribe to user defined valve state and ota notification topics */
-			if(esp_mqtt_client_subscribe(mqtt_client, MQTT_IN_DATA_TOPIC, 0) == -1) {
+			if(esp_mqtt_client_subscribe(mqtt_client, MQTT_INPUT_TOPIC, 0) == -1) {
 				ESP_LOGE(TAG, "Failed subscribing to topic");
 			}
 			else {
-				ESP_LOGI(TAG, "Sent subscribe successful to %s topic", MQTT_IN_DATA_TOPIC);
+				ESP_LOGI(TAG, "Sent subscribe successful to %s topic", MQTT_INPUT_TOPIC);
 			}
 
 			break;
@@ -518,7 +520,7 @@ static void mqtt_event_handler(void * arg, esp_event_base_t event_base,
 				fprintf(log_file, "A%lld.csv\n", epoch);
 
 				/* Print event in log file */
-				fprintf(log_file, "%s MQTT-IN: %s %s\n", timestamp, MQTT_IN_DATA_TOPIC, incoming_mqtt_data);
+				fprintf(log_file, "%s MQTT-IN: %s %s\n", timestamp, MQTT_INPUT_TOPIC, incoming_mqtt_data);
 
 				/* Check for values over 60 sec */
 				if(get_data_time > 60) {
@@ -597,19 +599,19 @@ void get_imu_data_task(void * arg) {
 				/* Check thresholds and publish */
 				if(samples_count % 50 == 1) { /* todo: in macros */
 					if(IMU_THRESHOLD_0 < acce_max && acce_max < IMU_THRESHOLD_1) {
-						esp_mqtt_client_publish(mqtt_client, MQTT_OUT_DATA_TOPIC, "THRESHOLD0", 0, 0, 0);
+						esp_mqtt_client_publish(mqtt_client, MQTT_OUTPUT_TOPIC, "THRESHOLD0", 0, 0, 0);
 						printf("THRESHOLD0\n");
-						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUT_DATA_TOPIC, "THRESHOLD0");
+						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUTPUT_TOPIC, "THRESHOLD0");
 					}
 					else if(IMU_THRESHOLD_1 < acce_max && acce_max < IMU_THRESHOLD_2) {
-						esp_mqtt_client_publish(mqtt_client, MQTT_OUT_DATA_TOPIC, "THRESHOLD1", 0, 0, 0);
+						esp_mqtt_client_publish(mqtt_client, MQTT_OUTPUT_TOPIC, "THRESHOLD1", 0, 0, 0);
 						printf("THRESHOLD1\n");
-						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUT_DATA_TOPIC, "THRESHOLD1");
+						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUTPUT_TOPIC, "THRESHOLD1");
 					}
 					else if(acce_max > IMU_THRESHOLD_2) {
-						esp_mqtt_client_publish(mqtt_client, MQTT_OUT_DATA_TOPIC, "THRESHOLD2", 0, 0, 0);
+						esp_mqtt_client_publish(mqtt_client, MQTT_OUTPUT_TOPIC, "THRESHOLD2", 0, 0, 0);
 						printf("THRESHOLD2\n");
-						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUT_DATA_TOPIC, "THRESHOLD2");
+						fprintf(log_file, "%s MQTT-OUT: %s %s\n", timestamp, MQTT_OUTPUT_TOPIC, "THRESHOLD2");
 					}
 					else {
 						printf("IDLE\n");
@@ -627,7 +629,7 @@ void get_imu_data_task(void * arg) {
 
 			ESP_LOGI(TAG, "Samples quantity reached or stop flag set. Closing file...");
 			if(stop_flag) {
-				fprintf(log_file, "%s MQTT-IN: %s %s\n", timestamp, MQTT_IN_DATA_TOPIC, incoming_mqtt_data);
+				fprintf(log_file, "%s MQTT-IN: %s %s\n", timestamp, MQTT_INPUT_TOPIC, incoming_mqtt_data);
 				stop_flag = false;
 			}
 
