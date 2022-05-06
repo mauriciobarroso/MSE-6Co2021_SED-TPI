@@ -1,6 +1,6 @@
 # Trabajo Pŕactico Integrado para la materia Sistemas Embebidos Distribuidos
 
-## Oganización
+## Carpetas
 El proyecto está compuesto por varias carpetas donde se encuentran todos los entregables del trabajo.
 
 ### broker_files
