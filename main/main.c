@@ -533,7 +533,9 @@ static void mqtt_event_handler(void * arg, esp_event_base_t event_base,
 			/* Check if the array is the stop command */
 			else if(!strcmp(incoming_mqtt_data, "stop")) {
 				ESP_LOGI(TAG, "Stop command");
-				stop_flag = true;
+				if(is_processing) {
+					stop_flag = true;
+				}
 			}
 			/* Other messages */
 			else {
