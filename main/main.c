@@ -70,9 +70,8 @@
 #define WIFI_AP_MAX_CONN			(3)
 #define MQTT_BROKER_HOST			"192.168.1.127"
 #define MQTT_BROKER_PORT			(1883)
-#define MQTT_IN_DATA_TOPIC			"data/in/node-app"
-#define MQTT_OUT_DATA_TOPIC			"data/out/node-esp32s2"
-#define MQTT_OUT
+#define MQTT_IN_DATA_TOPIC			"data/app"
+#define MQTT_OUT_DATA_TOPIC			"data/node"
 
 #define IMU_SAMPLING_RATE_HZ		(100.0)
 #define IMU_SAMPLING_RATE_MS		((1 / IMU_SAMPLING_RATE_HZ) * 1000)
@@ -136,6 +135,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(file_server_init());
     ESP_ERROR_CHECK(i2c_master_init());
     ESP_ERROR_CHECK(mpu6050_init(&mpu6050, MPU6050_DEV_ADDR, I2C_MASTER_NUM, ACCE_FS_4G, GYRO_FS_250DPS));
+	CRONO_sntpInit();
 
     /* Create RTOS components */
     mqtt_queue = xQueueCreate(2, sizeof(int));
@@ -374,6 +374,7 @@ static esp_err_t i2c_master_init(void) {
 static esp_err_t spiffs_init(void) {
 	esp_err_t ret;
 
+	esp_spiffs_format(NULL);
     ESP_LOGI(TAG, "Initializing SPIFFS...");
 
     esp_vfs_spiffs_conf_t conf = {
@@ -452,12 +453,6 @@ static void ip_event_handler(void * arg, esp_event_base_t event_base,
 
 			/* Start MQTT client */
 			esp_mqtt_client_start(mqtt_client);
-
-			/* Initialize SNTP */
-			CRONO_sntpInit();
-			epoch = CRONO_getTime(timestamp, sizeof(timestamp));
-			printf("MAIN: Timestamp %s: \n", timestamp);
-			printf("MAIN: Epoch %lli: \n'", epoch);
 
 			break;
 		}
