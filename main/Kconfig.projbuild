@@ -1,14 +1,49 @@
-# put here your custom config value
-menu "Example Configuration"
-config ESP_WIFI_SSID
-    string "WiFi SSID"
-    default "myssid"
+menu "Application Configuration"
+config APP_WIFI_STA_SSID
+    string "WiFi station SSID"
+    default "stationssid"
     help
-	SSID (network name) for the example to connect to.
+	SSID (network name) for the application to connect to.
 
-config ESP_WIFI_PASSWORD
+config APP_WIFI_STA_PASS
     string "WiFi Password"
-    default "mypassword"
+    default "stationpassword"
     help
-	WiFi password (WPA or WPA2) for the example to use.
+	WiFi password (WPA or WPA2) for the application to use.
+	
+config APP_WIFI_AP_SSID
+    string "WiFi Soft-AP SSID"
+    default "serverssid"
+    help
+	SSID (network name) for the Soft-AP.
+	
+config APP_WIFI_AP_MAX_CONN
+	int "Max number of clients"
+	default 3
+	help
+	Max number of clients connected to AP at the same time.
+	
+config APP_MQTT_HOST
+    string "MQTT host"
+    default "localhost"
+    help
+	MQTT broker, must be an IPv4 address.
+	
+config APP_MQTT_PORT
+    int "MQTT port"
+    default 1883
+    help
+	MQTT port number.
+	
+config APP_MQTT_INPUT_TOPIC
+    string "MQTT input topic"
+    default "data/app"
+    help
+	MQTT data input topic.
+	
+config APP_MQTT_OUTPUT_TOPIC
+    string "MQTT input topic"
+    default "data/node"
+    help
+	MQTT data output topic.
 endmenu
