@@ -3,7 +3,7 @@ pkg load signal
 %%
 % Import CSV file and plot timestamp vs acce_z
 %%
-csv_file = csvread('A1651796182317.csv');
+csv_file = csvread('../node_files/A1651796182317.csv');
 timestamp = csv_file(:, 1);
 acce_z = csv_file(:, 2);
 figure;
